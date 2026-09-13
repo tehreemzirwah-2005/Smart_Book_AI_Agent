@@ -1,294 +1,427 @@
 import os
 import json
+import sqlite3
+from datetime import datetime, timedelta
 import streamlit as st
-from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from openai import OpenAI
 
 # ==========================================
-# 1. PAGE SETUP & UI STYLING
+# 1. DATABASE & INITIALIZATION
 # ==========================================
-st.set_page_config(page_title="SmartBook AI - Automated Booking Agent", page_icon="⚡", layout="wide")
+DB_NAME = "smartbook.db"
 
-st.markdown("""
-    <style>
-    .stApp { background: linear-gradient(135deg, #F8FAFC 0%, #EFF6FF 100%); }
-    .main-title {
-        background: -webkit-linear-gradient(45deg, #4F46E5, #9333EA, #EC4899);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        font-size: 2.6rem; font-weight: 900; text-align: center; margin-bottom: 5px;
-    }
-    .sub-title { text-align: center; color: #64748B; font-size: 1.1rem; margin-bottom: 25px; }
-    .metric-card {
-        background: white; border-radius: 12px; padding: 18px; text-align: center;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.05); border: 1px solid #E2E8F0;
-    }
-    .metric-value { font-size: 2rem; font-weight: 800; color: #0F172A; }
-    .metric-label { color: #64748B; font-size: 0.8rem; font-weight: 600; text-transform: uppercase; }
-    .wa-card {
-        background: #E5DDD5; border-radius: 15px; padding: 15px; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-    }
-    .wa-bubble-user {
-        background: #DCF8C6; padding: 10px 14px; border-radius: 10px; margin: 8px 0; max-width: 80%; float: right; clear: both; color: #000;
-    }
-    .wa-bubble-ai {
-        background: #FFFFFF; padding: 10px 14px; border-radius: 10px; margin: 8px 0; max-width: 80%; float: left; clear: both; color: #000;
-    }
-    .notification-box {
-        background: #F0FDF4; border: 1px solid #86EFAC; border-radius: 8px; padding: 10px; margin-top: 5px; font-size: 0.9rem;
-    }
-    </style>
-""", unsafe_allow_html=True)
-
-GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY"))
-
-st.markdown('<p class="main-title">SmartBook AI Enterprise Agent ⚡</p>', unsafe_allow_html=True)
-st.markdown('<p class="sub-title">Autonomous Appointment Scheduling, Dynamic Slot Recovery & Instant WhatsApp Dispatch</p>', unsafe_allow_html=True)
-
-# ==========================================
-# 2. STATE INITIALIZATION (REAL-TIME DATA)
-# ==========================================
-if "slots" not in st.session_state:
-    st.session_state.slots = [
-        {"id": 1, "time": "09:00 AM", "status": "Available", "client": "", "phone": "", "service": "General Consultation"},
-        {"id": 2, "time": "10:30 AM", "status": "Available", "client": "", "phone": "", "service": "General Consultation"},
-        {"id": 3, "time": "01:00 PM", "status": "Available", "client": "", "phone": "", "service": "General Consultation"},
-        {"id": 4, "time": "03:00 PM", "status": "Available", "client": "", "phone": "", "service": "General Consultation"},
-        {"id": 5, "time": "04:30 PM", "status": "Available", "client": "", "phone": "", "service": "General Consultation"}
-    ]
-
-if "notifications" not in st.session_state:
-    st.session_state.notifications = []
-
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-
-if "doctor_phone" not in st.session_state:
-    st.session_state.doctor_phone = "+923001234567"
-
-# Helper Function: Process Slot Updates from AI Actions
-def apply_ai_slot_action(action_type, target_time, client_name="", phone=""):
-    for slot in st.session_state.slots:
-        if slot["time"].lower().strip() == target_time.lower().strip():
-            if action_type == "BOOK":
-                slot["status"] = "Confirmed"
-                slot["client"] = client_name
-                slot["phone"] = phone
-                st.session_state.notifications.append({
-                    "to": f"Doctor ({st.session_state.doctor_phone}) & Client ({phone})",
-                    "msg": f"✅ CONFIRMED: Appointment for {client_name} at {slot['time']} ({slot['service']}).",
-                    "type": "Confirmation"
-                })
-                return True
-            elif action_type == "CANCEL":
-                old_client = slot["client"]
-                slot["status"] = "Available"
-                slot["client"] = ""
-                slot["phone"] = ""
-                st.session_state.notifications.append({
-                    "to": f"Doctor ({st.session_state.doctor_phone})",
-                    "msg": f"⚠️ CANCELLED: Slot at {slot['time']} by {old_client} is now FREE for new clients.",
-                    "type": "Cancellation"
-                })
-                return True
-    return False
-
-# ==========================================
-# 3. PORTAL SELECTOR (ADMIN vs CLIENT)
-# ==========================================
-portal_mode = st.sidebar.radio("🌐 Select System Portal:", ["📱 Client WhatsApp & Self-Booking", "👨‍⚕️ Physician / Admin Operations"])
-
-# ------------------------------------------
-# PORTAL 1: CLIENT WHATSAPP & SELF-BOOKING
-# ------------------------------------------
-if portal_mode == "📱 Client WhatsApp & Self-Booking":
-    st.subheader("📱 WhatsApp AI Booking Assistant")
-    st.caption("Clients can select free slots visually OR chat naturally with AI to Book, Cancel, or Reschedule.")
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
     
-    col_left, col_right = st.columns([1, 1])
-
-    # Dynamic Slot Selector
-    with col_left:
-        st.markdown("### 📅 Real-Time Available Slots")
-        free_slots = [s for s in st.session_state.slots if s["status"] == "Available"]
-        
-        if not free_slots:
-            st.warning("⚠️ All slots booked for today! Chat with AI below to get added to the waiting list or check cancellations.")
-        else:
-            for s in free_slots:
-                with st.container():
-                    st.markdown(f"""
-                    <div style="background:white; border-left:5px solid #10B981; padding:12px; border-radius:8px; margin-bottom:10px;">
-                        <strong>⏰ Time: {s['time']}</strong> | Service: {s['service']}
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
-                    with st.expander(f"Book Slot: {s['time']}"):
-                        with st.form(f"manual_book_{s['id']}"):
-                            c_name = st.text_input("Full Name:")
-                            c_phone = st.text_input("WhatsApp Mobile Number:")
-                            btn = st.form_submit_button("Confirm Booking")
-                            if btn and c_name and c_phone:
-                                apply_ai_slot_action("BOOK", s['time'], c_name, c_phone)
-                                st.success("🎉 Slot Booked! Automated confirmation sent to Doctor and Client.")
-                                st.rerun()
-
-    # WhatsApp AI Chat Interface
-    with col_right:
-        st.markdown("### 💬 Automated AI Conversational Agent")
-        
-        for msg in st.session_state.chat_history:
-            role = "user" if isinstance(msg, HumanMessage) else "assistant"
-            with st.chat_message(role):
-                st.markdown(msg.content)
-
-        user_input = st.chat_input("Type e.g., 'Book 10:30 AM slot for Ali (+92300...)' or 'Cancel my slot'...")
-
-        if user_input:
-            with st.chat_message("user"):
-                st.markdown(user_input)
-            st.session_state.chat_history.append(HumanMessage(content=user_input))
-
-            if not GROQ_API_KEY:
-                st.error("🔑 GROQ_API_KEY missing in Secrets!")
-            else:
-                with st.chat_message("assistant"):
-                    with st.spinner("AI checking Live Calendar & executing actions..."):
-                        try:
-                            llm = ChatGroq(
-                                groq_api_key=GROQ_API_KEY,
-                                model_name="openai/gpt-oss-120b",
-                                temperature=0.1
-                            )
-                            
-                            system_prompt = f"""
-                            You are SmartBook AI, an autonomous appointment agent.
-                            
-                            LIVE CALENDAR SLOTS DATA:
-                            {json.dumps(st.session_state.slots)}
-                            
-                            YOUR CAPABILITIES & INSTRUCTIONS:
-                            1. Read live calendar slots above accurately.
-                            2. If client wants to BOOK a free slot and provides name + phone number, instruct system in response and inform client it's booked.
-                            3. If client wants to CANCEL or RESCHEDULE, automatically free up their old slot and book the new available slot.
-                            4. Keep responses brief, polite, and professional (WhatsApp format).
-                            """
-                            
-                            formatted = [SystemMessage(content=system_prompt)] + st.session_state.chat_history
-                            response = llm.invoke(formatted)
-                            reply = response.content
-                            
-                            # Simple AI Action Parser for Autonomous State Management
-                            lower_input = user_input.lower()
-                            for s in st.session_state.slots:
-                                slot_t = s["time"].lower()
-                                if slot_t in lower_input:
-                                    if "book" in lower_input or "confirm" in lower_input:
-                                        apply_ai_slot_action("BOOK", s["time"], "WhatsApp Client", "+92300XXXXXXX")
-                                    elif "cancel" in lower_input or "reschedule" in lower_input:
-                                        apply_ai_slot_action("CANCEL", s["time"])
-                            
-                            st.markdown(reply)
-                            st.session_state.chat_history.append(AIMessage(content=reply))
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Error: {str(e)}")
-
-# ------------------------------------------
-# PORTAL 2: PHYSICIAN / ADMIN OPERATIONS
-# ------------------------------------------
-else:
-    st.subheader("👨‍⚕️ Physician & Admin Operational Dashboard")
-    st.caption("Zero manual workload: AI handles calendar updates, slot recovery, and dispatches instant notifications.")
-
-    # High Level Metrics
-    total = len(st.session_state.slots)
-    avail = sum(1 for s in st.session_state.slots if s["status"] == "Available")
-    conf = sum(1 for s in st.session_state.slots if s["status"] == "Confirmed")
-
-    m1, m2, m3 = st.columns(3)
-    with m1:
-        st.markdown(f'<div class="metric-card"><div class="metric-value">{total}</div><div class="metric-label">Total Daily Slots</div></div>', unsafe_allow_html=True)
-    with m2:
-        st.markdown(f'<div class="metric-card"><div class="metric-value" style="color:#10B981;">{avail}</div><div class="metric-label">Free Slots (Auto-Managed)</div></div>', unsafe_allow_html=True)
-    with m3:
-        st.markdown(f'<div class="metric-card"><div class="metric-value" style="color:#4F46E5;">{conf}</div><div class="metric-label">Confirmed Patients</div></div>', unsafe_allow_html=True)
-
-    st.markdown("---")
+    # Business & Physician Tables
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS availability (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            physician_name TEXT,
+            slot_time TEXT,
+            status TEXT DEFAULT 'AVAILABLE', -- AVAILABLE, HELD, CONFIRMED, CANCELLED
+            date TEXT
+        )
+    ''')
     
-    c_sched, c_notif = st.columns([1.2, 1])
+    # Appointments Table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS appointments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_name TEXT,
+            client_phone TEXT,
+            physician_name TEXT,
+            slot_time TEXT,
+            status TEXT DEFAULT 'CONFIRMED',
+            date TEXT
+        )
+    ''')
+    
+    # Waiting List Table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS waiting_list (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_name TEXT,
+            client_phone TEXT,
+            preferred_date TEXT,
+            status TEXT DEFAULT 'PENDING'
+        )
+    ''')
+    
+    # AI Activity Log
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ai_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            action TEXT,
+            details TEXT
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
 
-    # Live Doctor Schedule View
-    with c_sched:
-        st.markdown("### 📋 Live Master Calendar")
-        for s in st.session_state.slots:
-            st_color = "#10B981" if s["status"] == "Available" else "#4F46E5"
-            st.markdown(f"""
-            <div style="background:white; border-left:6px solid {st_color}; padding:12px; border-radius:10px; margin-bottom:10px; box-shadow:0 2px 4px rgba(0,0,0,0.04);">
-                <div style="display:flex; justify-content:space-between; align-items:center;">
-                    <div>
-                        <strong>⏰ {s['time']}</strong> - <span>{s['service']}</span><br/>
-                        <small>Patient: <b>{s['client'] if s['client'] else 'No Booking Yet'}</b> ({s['phone']})</small>
-                    </div>
-                    <div>
-                        <span style="background:{st_color}; color:white; padding:4px 10px; border-radius:12px; font-size:0.8rem; font-weight:bold;">{s['status']}</span>
-                    </div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+init_db()
+
+# ==========================================
+# 2. DETERMINISTIC BACKEND ENGINE & TOOLS
+# ==========================================
+
+def get_db_connection():
+    return sqlite3.connect(DB_NAME)
+
+def log_ai_action(action, details):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO ai_logs (timestamp, action, details) VALUES (?, ?, ?)",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), action, details)
+    )
+    conn.commit()
+    conn.close()
+
+# --- BACKEND FUNCTIONS CALLED BY AI OR UI ---
+
+def db_get_available_slots(date_str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT slot_time FROM availability WHERE date = ? AND status = 'AVAILABLE'",
+        (date_str,)
+    )
+    slots = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return slots
+
+def db_book_appointment(client_name, client_phone, physician_name, slot_time, date_str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Deterministic Lock Check
+    cursor.execute(
+        "SELECT status FROM availability WHERE date = ? AND slot_time = ? AND physician_name = ?",
+        (date_str, slot_time, physician_name)
+    )
+    row = cursor.fetchone()
+    
+    if not row or row[0] != 'AVAILABLE':
+        conn.close()
+        return {"success": False, "message": "Slot is no longer available."}
+    
+    # Update availability slot to CONFIRMED
+    cursor.execute(
+        "UPDATE availability SET status = 'CONFIRMED' WHERE date = ? AND slot_time = ? AND physician_name = ?",
+        (date_str, slot_time, physician_name)
+    )
+    
+    # Create Appointment Record
+    cursor.execute(
+        "INSERT INTO appointments (client_name, client_phone, physician_name, slot_time, status, date) VALUES (?, ?, ?, ?, 'CONFIRMED', ?)",
+        (client_name, client_phone, physician_name, slot_time, date_str)
+    )
+    
+    conn.commit()
+    conn.close()
+    
+    log_ai_action("BOOK_APPOINTMENT", f"Booked {slot_time} for {client_name}")
+    return {"success": True, "message": f"Appointment confirmed for {slot_time} with {physician_name}."}
+
+def db_cancel_appointment(client_phone, date_str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute(
+        "SELECT id, slot_time, physician_name FROM appointments WHERE client_phone = ? AND date = ? AND status = 'CONFIRMED'",
+        (client_phone, date_str)
+    )
+    appt = cursor.fetchone()
+    
+    if not appt:
+        conn.close()
+        return {"success": False, "message": "No active appointment found for this phone number."}
+    
+    appt_id, slot_time, physician_name = appt
+    
+    # Cancel appointment
+    cursor.execute("UPDATE appointments SET status = 'CANCELLED' WHERE id = ?", (appt_id,))
+    
+    # Release Slot back to AVAILABLE
+    cursor.execute(
+        "UPDATE availability SET status = 'AVAILABLE' WHERE date = ? AND slot_time = ? AND physician_name = ?",
+        (date_str, slot_time, physician_name)
+    )
+    
+    conn.commit()
+    conn.close()
+    
+    log_ai_action("CANCEL_APPOINTMENT", f"Cancelled appt for {client_phone}. Released slot {slot_time}.")
+    return {"success": True, "released_slot": slot_time, "message": "Appointment cancelled successfully."}
+
+def db_add_to_waitlist(client_name, client_phone, date_str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO waiting_list (client_name, client_phone, preferred_date) VALUES (?, ?, ?)",
+        (client_name, client_phone, date_str)
+    )
+    conn.commit()
+    conn.close()
+    log_ai_action("WAITLIST_ADDED", f"Added {client_name} ({client_phone}) to waitlist for {date_str}")
+    return {"success": True, "message": "Added to waiting list successfully."}
+
+# ==========================================
+# 3. OPENAI TOOL-CALLING AI RECEPTIONIST
+# ==========================================
+
+tools_schema = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_available_slots",
+            "description": "Fetch available appointment slots for a given date.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date_str": {"type": "string", "description": "YYYY-MM-DD format"}
+                },
+                "required": ["date_str"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "book_appointment",
+            "description": "Book an appointment slot after deterministic availability verification.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "client_name": {"type": "string"},
+                    "client_phone": {"type": "string"},
+                    "physician_name": {"type": "string"},
+                    "slot_time": {"type": "string"},
+                    "date_str": {"type": "string"}
+                },
+                "required": ["client_name", "client_phone", "physician_name", "slot_time", "date_str"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_appointment",
+            "description": "Cancel an appointment and automatically release the slot.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "client_phone": {"type": "string"},
+                    "date_str": {"type": "string"}
+                },
+                "required": ["client_phone", "date_str"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_to_waitlist",
+            "description": "Add client to waitlist if no slots are available.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "client_name": {"type": "string"},
+                    "client_phone": {"type": "string"},
+                    "date_str": {"type": "string"}
+                },
+                "required": ["client_name", "client_phone", "date_str"]
+            }
+        }
+    }
+]
+
+def run_ai_receptionist(user_prompt, conversation_history):
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return "⚠️ OpenAI API Key is missing. Please set OPENAI_API_KEY environment variable."
+    
+    client = OpenAI(api_key=api_key)
+    
+    system_instruction = f"""
+    You are SmartBook AI, a virtual receptionist for ABC Medical Clinic (Dr. Ahmed).
+    Today's Date: {datetime.now().strftime('%Y-%m-%d')}.
+    
+    STRICT RULES:
+    1. NEVER invent slots. Always call `get_available_slots` to check real database state first.
+    2. MEDICAL SAFETY: Never give medical advice, diagnosis, or prescription. If user asks medical questions, escalate to clinic staff.
+    3. Keep responses friendly, short, and professional.
+    """
+    
+    messages = [{"role": "system", "content": system_instruction}] + conversation_history + [{"role": "user", "content": user_prompt}]
+    
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        tools=tools_schema,
+        tool_choice="auto"
+    )
+    
+    msg = response.choices[0].message
+    
+    # Handle Tool Execution Loop
+    if msg.tool_calls:
+        for tool_call in msg.tool_calls:
+            func_name = tool_call.function.name
+            args = json.loads(tool_call.function.arguments)
             
-            # Postpone / Override Controls for Doctor
-            if s["status"] == "Confirmed":
-                c_post, c_can = st.columns(2)
-                with c_post:
-                    if st.button(f"⏱️ Postpone #{s['id']}", key=f"post_{s['id']}"):
-                        s["status"] = "Available"
-                        st.session_state.notifications.append({
-                            "to": f"Client ({s['phone']})",
-                            "msg": f"📢 POSTPONED: Your appointment at {s['time']} has been postponed by the physician. Please choose another slot.",
-                            "type": "Postponement"
-                        })
-                        s["client"] = ""
-                        s["phone"] = ""
-                        st.success("Slot postponed and freed up!")
-                        st.rerun()
-                with c_can:
-                    if st.button(f"🚫 Cancel #{s['id']}", key=f"can_{s['id']}"):
-                        apply_ai_slot_action("CANCEL", s["time"])
-                        st.rerun()
-
-        # One-Time Slot Creator
-        st.markdown("---")
-        st.markdown("### ➕ Admin Initial Setup: Add Custom Slot")
-        with st.form("add_custom_slot"):
-            new_t = st.text_input("Slot Time (e.g., 06:00 PM):")
-            new_s = st.text_input("Service Name:", value="Follow-up Consultation")
-            if st.form_submit_button("Add Slot to AI Engine"):
-                if new_t:
-                    st.session_state.slots.append({
-                        "id": len(st.session_state.slots) + 1,
-                        "time": new_t,
-                        "status": "Available",
-                        "client": "",
-                        "phone": "",
-                        "service": new_s
-                    })
-                    st.success("New slot added to live calendar!")
-                    st.rerun()
-
-    # WhatsApp Automated Notifications Audit Log
-    with c_notif:
-        st.markdown("### 📲 Automated Dispatch Audit Log")
-        st.caption("Live stream of automated SMS/WhatsApp messages sent by AI to Doctor & Clients.")
+            tool_result = {}
+            if func_name == "get_available_slots":
+                slots = db_get_available_slots(args.get("date_str"))
+                tool_result = {"available_slots": slots}
+            elif func_name == "book_appointment":
+                tool_result = db_book_appointment(
+                    args.get("client_name"), args.get("client_phone"),
+                    args.get("physician_name"), args.get("slot_time"), args.get("date_str")
+                )
+            elif func_name == "cancel_appointment":
+                tool_result = db_cancel_appointment(args.get("client_phone"), args.get("date_str"))
+            elif func_name == "add_to_waitlist":
+                tool_result = db_add_to_waitlist(args.get("client_name"), args.get("client_phone"), args.get("date_str"))
+            
+            messages.append(msg)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": json.dumps(tool_result)
+            })
         
-        if not st.session_state.notifications:
-            st.info("No dispatches logged yet. Book or cancel a slot to see real-time automated messages.")
-        else:
-            for n in reversed(st.session_state.notifications):
-                st.markdown(f"""
-                <div class="notification-box">
-                    <strong>📢 Dispatch Type: {n['type']}</strong><br/>
-                    <small><b>To:</b> {n['to']}</small><br/>
-                    <span>{n['msg']}</span>
-                </div>
-                """, unsafe_allow_html=True)
+        # Second call to LLM to summarize response in natural language
+        second_response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages
+        )
+        return second_response.choices[0].message.content
+        
+    return msg.content
+
+# ==========================================
+# 4. STREAMLIT FRONTEND DASHBOARD
+# ==========================================
+
+st.set_page_config(page_title="SmartBook Agent", layout="wide", page_icon="📅")
+
+st.title("🤖 SmartBook Agent - AI Appointment Receptionist")
+st.caption("AI-Operated Appointment Management Infrastructure")
+
+# Sidebar - Persona Switcher
+app_mode = st.sidebar.radio("Select View / User Type:", ["Physician Morning Setup", "Client AI Receptionist", "Admin SaaS Dashboard"])
+
+today_str = datetime.now().strftime("%Y-%m-%d")
+
+# ------------------------------------------
+# A. PHYSICIAN DASHBOARD
+# ------------------------------------------
+if app_mode == "Physician Morning Setup":
+    st.header("👨‍⚕️ Physician Morning Availability")
+    st.subheader(f"Dr. Ahmed — {today_str}")
+    
+    slots_list = [
+        "09:00 AM", "09:30 AM", "10:00 AM", "10:30 AM",
+        "11:00 AM", "11:30 AM", "03:00 PM", "03:30 PM", "04:00 PM"
+    ]
+    
+    st.write("Select available slots for today and publish:")
+    selected_slots = st.multiselect("Today's Available Hours", slots_list, default=slots_list[:5])
+    
+    if st.button("Publish Today's Availability", type="primary"):
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Reset current day's available slots
+        cursor.execute("DELETE FROM availability WHERE date = ? AND status = 'AVAILABLE'", (today_str,))
+        
+        for slot in selected_slots:
+            cursor.execute(
+                "INSERT INTO availability (physician_name, slot_time, status, date) VALUES (?, ?, 'AVAILABLE', ?)",
+                ("Dr. Ahmed", slot, today_str)
+            )
+        conn.commit()
+        conn.close()
+        
+        st.success(f"🟢 Published {len(selected_slots)} slots! SmartBook AI is now managing your schedule.")
+        log_ai_action("PHYSICIAN_PUBLISH", f"Published {len(selected_slots)} slots for Dr. Ahmed.")
+
+# ------------------------------------------
+# B. CLIENT AI CHATBOT INTERFACE
+# ------------------------------------------
+elif app_mode == "Client AI Receptionist":
+    st.header("💬 WhatsApp / AI Receptionist Assistant")
+    st.info("Test AI tool-calling for booking, cancellation, and availability checks.")
+    
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if prompt := st.chat_input("Hi, can I book an appointment with Dr. Ahmed today?"):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("AI is verifying database state..."):
+                # Pass previous history for context
+                conv_history = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages[:-1]]
+                response_text = run_ai_receptionist(prompt, conv_history)
+                st.markdown(response_text)
+                
+        st.session_state.messages.append({"role": "assistant", "content": response_text})
+
+# ------------------------------------------
+# C. ADMIN SAAS DASHBOARD
+# ------------------------------------------
+elif app_mode == "Admin SaaS Dashboard":
+    st.header("📈 Business Admin & Analytics Dashboard")
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Analytics Metrics
+    cursor.execute("SELECT COUNT(*) FROM appointments WHERE date = ? AND status = 'CONFIRMED'", (today_str,))
+    confirmed_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM availability WHERE date = ? AND status = 'AVAILABLE'", (today_str,))
+    available_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM appointments WHERE date = ? AND status = 'CANCELLED'", (today_str,))
+    cancelled_count = cursor.fetchone()[0]
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Confirmed Appointments", confirmed_count)
+    col2.metric("Available Slots", available_count)
+    col3.metric("Cancellations", cancelled_count)
+    col4.metric("Est. Revenue Saved", f"${confirmed_count * 100}")
+    
+    st.divider()
+    
+    # Live Schedule Board
+    st.subheader("📅 Today's Live Schedule Engine")
+    cursor.execute("SELECT slot_time, status, physician_name FROM availability WHERE date = ?", (today_str,))
+    slots_data = cursor.fetchall()
+    
+    if slots_data:
+        st.table([{"Time Slot": s[0], "Status": s[1], "Physician": s[2]} for s in slots_data])
+    else:
+        st.warning("No availability published for today yet.")
+
+    # Real-time AI Action Logs
+    st.subheader("🤖 AI Real-Time Activity Log")
+    cursor.execute("SELECT timestamp, action, details FROM ai_logs ORDER BY id DESC LIMIT 10")
+    logs = cursor.fetchall()
+    
+    if logs:
+        st.table([{"Timestamp": l[0], "Action": l[1], "Details": l[2]} for l in logs])
+        
+    conn.close()
