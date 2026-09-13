@@ -135,11 +135,19 @@ def run_ai_receptionist(user_prompt, conversation_history, api_key):
     if not api_key:
         return "⚠️ Please enter your OpenAI API Key in the sidebar!"
     
-    client = OpenAI(api_key=api_key)
-    system_instruction = f"You are SmartBook AI for ABC Medical Clinic. Today's Date: {datetime.now().strftime('%Y-%m-%d')}."
-    messages = [{"role": "system", "content": system_instruction}] + conversation_history + [{"role": "user", "content": user_prompt}]
-    
-    response = client.chat.completions.create(model="gpt-4o", messages=messages, tools=tools_schema, tool_choice="auto")
+  
+client = OpenAI(
+    base_url="https://api.groq.com/openai/v1",
+    api_key=""  # Yahan Groq key lagayein
+)
+
+
+response = client.chat.completions.create(
+    model="openai/gpt-oss-120b",
+    messages=messages,
+    tools=tools_schema,
+    tool_choice="auto"
+)
     msg = response.choices[0].message
     
     if msg.tool_calls:
